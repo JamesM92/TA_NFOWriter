@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# example/test libraries (TubeArchivist channel folders)
+UC??????????????????????/
+# AI session handoff notes (local only)
+HANDOFF.md
+# default view output (built next to the script)
+tvseries/
+nfoexample/
