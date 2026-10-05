@@ -502,6 +502,20 @@ class ViewModeTests(ViewBase):
         self.assertIn("NBC News", names)
         self.assertTrue(any(n.startswith("NBC News [UC") for n in names))
 
+    def test_an_empty_channel_folder_is_reused_not_doubled(self):
+        (self.view / "NBC News").mkdir()  # left behind by a run that stopped before writing anything
+        self.video("aaaaaaaaaaa", mp4_bytes(full_items()))
+        self.vrun()
+        self.assertEqual([p.name for p in self.view.iterdir()], ["NBC News"])
+        self.assertTrue((self.show / "tvshow.nfo").exists())
+
+    def test_a_folder_with_other_content_still_counts_as_taken(self):
+        (self.view / "NBC News").mkdir()
+        (self.view / "NBC News" / "mine.txt").write_text("x")
+        self.video("aaaaaaaaaaa", mp4_bytes(full_items()))
+        self.vrun()
+        self.assertTrue(any(p.name.startswith("NBC News [UC") for p in self.view.iterdir()))
+
     def test_names_are_sanitised(self):
         self.video("aaaaaaaaaaa", mp4_bytes(full_items(title='A/B: "C"? ' + "x" * 300 + "...")))
         self.vrun()
