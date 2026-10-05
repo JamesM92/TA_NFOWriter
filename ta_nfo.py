@@ -613,6 +613,13 @@ def channel_uid(tvshow: Path):
     return m.group(1) if m else None
 
 
+def is_empty_dir(d: Path):
+    try:
+        return not any(d.iterdir())
+    except OSError:
+        return False
+
+
 class ViewIndex:
     """Channel folders already in the view, found by the channel id inside tvshow.nfo (no state file)."""
 
@@ -623,10 +630,12 @@ class ViewIndex:
         if root.is_dir():
             for d in root.iterdir():
                 if d.is_dir():
-                    self.names.add(d.name.lower())
                     cid = channel_uid(d / "tvshow.nfo")
                     if cid:
                         self.by_channel[cid] = d
+                    elif is_empty_dir(d):
+                        continue  # left by a run that stopped early: free to use, not a name clash
+                    self.names.add(d.name.lower())
 
     def folder_for(self, channel_id, meta):
         """Existing folder, or a new name. A folder keeps its first name forever (Jellyfin tracks by path)."""

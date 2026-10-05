@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- View mode no longer builds a second `Channel [ID]` folder next to an empty `Channel` folder. An empty folder, such as one left by a run that stopped before writing anything, is reused. A folder with anything in it still counts as taken.
+
 ## [0.4.0] - 2026-10-04
 
 ### Added
