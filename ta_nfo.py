@@ -794,6 +794,12 @@ def process_channel_view(folder: Path, ctx: Ctx, pool, vindex: ViewIndex):
         show = existing
     if not args.dry_run:
         show.mkdir(parents=True, exist_ok=True)
+    tvshow = show / "tvshow.nfo"
+    # Write it first: it is how a later run recognises the folder, so a run that stops partway
+    # (server reboot) does not leave a folder that gets a duplicate `Channel [ID]` beside it.
+    fresh = not tvshow.exists()
+    if fresh and newest is not None:
+        ctx.write_xml(tvshow, tvshow_nfo(newest, folder.name), newest_path)
 
     sidecars = scan_sidecars(folder)
     added = False
@@ -830,8 +836,7 @@ def process_channel_view(folder: Path, ctx: Ctx, pool, vindex: ViewIndex):
                 ctx.write_xml(sdir / f"{base}.nfo", episode_nfo(meta, vid), path)
                 ctx.write_image(sdir, f"{base}-thumb", meta["thumb"], path)
 
-    tvshow = show / "tvshow.nfo"
-    if not (args.overwrite or channel_due(tvshow, show, newest_mtime, added, args.channel_refresh_days)):
+    if not (args.overwrite or fresh or channel_due(tvshow, show, newest_mtime, added, args.channel_refresh_days)):
         return
     if newest is None:
         return
