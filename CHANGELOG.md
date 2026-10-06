@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-05
+
+### Fixed
+- View mode writes `tvshow.nfo` as soon as a channel folder is made, before any episode. A run that stops partway (a server reboot, for example) leaves a folder the next run recognises and finishes, instead of a half-built folder that gets a duplicate `Channel [ID]` beside it.
+
 ## [0.4.1] - 2026-10-04
 
 ### Fixed

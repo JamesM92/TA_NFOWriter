@@ -509,6 +509,27 @@ class ViewModeTests(ViewBase):
         self.assertEqual([p.name for p in self.view.iterdir()], ["NBC News"])
         self.assertTrue((self.show / "tvshow.nfo").exists())
 
+    def test_a_run_stopped_partway_leaves_a_folder_the_next_run_reuses(self):
+        self.video("aaaaaaaaaaa", mp4_bytes(full_items()))
+        with mock.patch.object(ta_nfo, "ensure_link", side_effect=KeyboardInterrupt):  # the stop, before any episode
+            with self.assertRaises(KeyboardInterrupt):
+                self.vrun()
+        self.assertTrue((self.show / "tvshow.nfo").exists())
+        self.vrun()
+        self.assertEqual([p.name for p in self.view.iterdir()], ["NBC News"])
+        self.assertEqual(len(self.episode_links()), 1)
+
+    def test_tvshow_nfo_exists_before_any_episode_is_written(self):
+        self.video("aaaaaaaaaaa", mp4_bytes(full_items()))
+        order = []
+        real = ta_nfo.Ctx.write_xml
+        def spy(ctx, path, root, ref):
+            order.append(path.name)
+            return real(ctx, path, root, ref)
+        with mock.patch.object(ta_nfo.Ctx, "write_xml", spy):
+            self.vrun()
+        self.assertEqual(order[0], "tvshow.nfo")
+
     def test_a_folder_with_other_content_still_counts_as_taken(self):
         (self.view / "NBC News").mkdir()
         (self.view / "NBC News" / "mine.txt").write_text("x")
