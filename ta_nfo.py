@@ -34,6 +34,7 @@ Safe to run daily from cron:
     0 4 * * *  flock -n /tmp/ta_nfo.lock python3 /path/to/view/ta_nfo.py /path/to/library --cleanup --quiet
 """
 import argparse
+import collections
 import datetime
 import json
 import os
@@ -47,7 +48,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-__version__ = "0.4.2"  # bumped in the release commit; the dev branch keeps the last released value
+__version__ = "0.5.0"  # bumped in the release commit; the dev branch keeps the last released value
 
 CHANNEL_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
 VIDEO_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -61,7 +62,8 @@ TITLE_MAX_CHARS = 64  # episode title length in view file names (the NFO keeps t
 SCRIPT_FILE = Path(__file__).absolute()  # not resolved, so a symlinked script can be detected
 SCRIPT_DIR = Path(__file__).resolve().parent  # default view location
 DEFAULT_MIN_AGE_MINUTES = 10
-READ_BATCH = 100  # videos read, written and then released at a time, so memory does not grow with a channel's size
+DEFAULT_WORKERS = 16  # parallel tag reads; each read is a handful of small network round trips on a share
+PLAYLIST_SCANNED = ".scanned"  # inside <view>/Playlists: channel ids whose videos were read for playlists
 CHANNEL_IMAGES = {"channel_icon": "poster", "channel_banner": "banner", "channel_tv": "fanart"}
 IMAGE_EXTS = (".jpg", ".png", ".webp")
 STD_ATOMS = {"©nam", "©ART", "©day", "©gen", "desc", "ldes", "covr"}
@@ -152,6 +154,8 @@ def _read_meta(f, start, end, tags, skip=()):
             continue
         name = typ.decode("latin-1")
         if name in STD_ATOMS:
+            if name in skip:
+                continue
             key = name
         elif len(typ) == 4 and struct.unpack(">I", typ)[0] in keys:
             key = keys[struct.unpack(">I", typ)[0]]
@@ -169,6 +173,10 @@ def read_tags(path, skip=()):
     """Return {atom/tag name: raw bytes} for the atoms this tool uses, without the ones named in `skip`."""
     tags = {}
     with open(path, "rb") as f:
+        try:  # we jump around the file, so do not let the kernel (or an SMB client) read ahead megabytes
+            os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_RANDOM)
+        except (AttributeError, OSError):
+            pass
         size = os.fstat(f.fileno()).st_size
         moov = _find(f, 0, size, b"moov")
         if not moov:
@@ -217,11 +225,13 @@ def _playlists(raw):
     return out
 
 
-def read(mp4, images=False):
+def read(mp4, images=False, thumb=True):
     """Metadata for one video: the 'ta' tag wins, the standard atoms fill the gaps.
 
-    The three channel images (about 0.4 MB per video, identical across a channel) are only read with images=True."""
-    tags = read_tags(mp4, skip=() if images else tuple(CHANNEL_IMAGES))
+    The three channel images (about 0.4 MB per video, identical across a channel) are only read with images=True,
+    and the episode thumbnail (60 to 90 KB) only with thumb=True."""
+    skip = () if images else tuple(CHANNEL_IMAGES)
+    tags = read_tags(mp4, skip=skip if thumb else (*skip, "covr"))
 
     def text(key):
         raw = tags.get(key)
@@ -359,6 +369,10 @@ class Reporter:
         print(msg)
         self._log(msg)
 
+    def progress(self, msg):  # --progress lines: shown even with --quiet
+        print(msg, flush=True)
+        self._log(msg)
+
     def error(self, msg):
         self.errors += 1
         print(f"error: {msg}", file=sys.stderr)
@@ -400,7 +414,18 @@ class Ctx:
         self.stats = {"videos": 0, "written": 0, "removed": 0, "deferred": 0}
         self.playlists = {}  # playlist id -> newest playlist record seen this run (with "ref": a video path)
         self.links = {}  # video id -> episode link path made or planned this run
-        self.read_all = False  # first --playlists run: read every video once to find its playlists
+        self.track_scan = False  # --playlists: read each channel's videos once, remembering the channels done
+        self.scanned = set()  # channel ids already read for playlists (kept in <view>/Playlists/.scanned)
+        self.dirty = set()  # playlist ids collected or changed since their file was last written
+        self.links_preloaded = False  # ctx.links already holds every episode link in the view (--playlists)
+        self.window = 4 * DEFAULT_WORKERS  # reads allowed to run ahead of the writer
+        self.timing = {"scan": 0.0, "wait": 0.0}
+        self.stats["read"] = 0  # videos whose tags were read
+        self.stats["videos_done"] = 0  # videos handled so far (read or skipped), for --progress
+        self.total_videos = 0  # from a cheap pre-count, only with --progress
+        self.started = time.monotonic()
+        self.last_tick = self.started
+        self.recent = collections.deque(maxlen=12)  # (time, videos handled) samples for the rate
 
     def write(self, path: Path, data: bytes, ref: Path):
         self.rep.info(f"write {path}")
@@ -418,6 +443,28 @@ class Ctx:
             best = self.playlists.get(pl["id"])
             if best is None or pl["refresh"] >= best["refresh"]:
                 self.playlists[pl["id"]] = {**pl, "ref": ref}
+                self.dirty.add(pl["id"])
+
+    def tick(self, name, done, total):
+        """--progress: a heartbeat line at most every 30 s, so a big channel does not look stuck."""
+        if not self.args.progress:
+            return
+        now = time.monotonic()
+        if now - self.last_tick >= 30:
+            self.last_tick = now
+            self.rep.progress(f"  ... {name}: {done:,}/{total:,} videos, {self.rate_text(now)}")
+
+    def rate_text(self, now):
+        handled = self.stats["videos_done"]
+        self.recent.append((now, handled))
+        elapsed = now - self.started
+        t0, h0 = self.recent[0]
+        per_s = (handled - h0) / (now - t0) if now - t0 >= 5 else handled / max(elapsed, 1e-9)
+        text = f"{per_s:,.1f} videos/s, elapsed {fmt_duration(elapsed)}"
+        if self.total_videos and per_s > 0:
+            left = max(self.total_videos - handled, 0) / per_s
+            text += f", about {fmt_duration(left)} left ({100 * handled / self.total_videos:.0f}% done)"
+        return text
 
     def write_xml(self, path: Path, root, ref: Path):
         ET.indent(root)
@@ -429,39 +476,98 @@ class Ctx:
             self.write(folder / f"{stem}{image_ext(data)}", data, ref)
 
 
-def scan_videos(folder: Path):
-    """[(path, mtime)] for recognisable videos, newest first (ties broken by name)."""
-    found = []
+def fmt_duration(seconds):
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
+
+
+def scan_videos(folder: Path, pool=None):
+    """[(path, mtime)] for recognisable videos, newest first (ties broken by name).
+
+    Each stat is a network round trip on a share, so with a pool they run in parallel."""
+    entries = []
     with os.scandir(folder) as it:
         for e in it:
             if e.name.endswith(".mp4") and VIDEO_RE.match(e.name[:-4]) and e.is_file():
-                found.append((Path(e.path), e.stat().st_mtime))
+                entries.append(e)
+
+    def mtime(e):
+        try:
+            return e.stat().st_mtime
+        except OSError:  # vanished since the listing
+            return None
+
+    mtimes = pool.map(mtime, entries) if pool is not None and len(entries) > 32 else map(mtime, entries)
+    found = [(Path(e.path), m) for e, m in zip(entries, mtimes) if m is not None]
     found.sort(key=lambda v: (-v[1], v[0].name))
     return found
 
 
-def safe_read(path: Path, images=False):
+def prefetch(pool, func, items, window):
+    """Yield func(item) for each item in order, keeping up to `window` calls running ahead of the consumer.
+
+    Unlike pool.map this never queues everything at once (memory stays flat) and the reads overlap the
+    consumer's writes, which is what hides the network delay."""
+    pending = collections.deque()
+    source = iter(items)
+
+    def submit():
+        for item in source:
+            pending.append(pool.submit(func, item))
+            return
+
+    for _ in range(window):  # reading starts now, not when the first result is asked for
+        submit()
+
+    def results():
+        try:
+            while pending:
+                result = pending.popleft().result()
+                submit()
+                yield result
+        finally:
+            for fut in pending:
+                fut.cancel()
+
+    return results()
+
+
+def timed(ctx, key, results):
+    """Pass `results` through, adding the time spent waiting for each item to ctx.timing[key]."""
+    it = iter(results)
+    while True:
+        t = time.perf_counter()
+        try:
+            item = next(it)
+        except StopIteration:
+            return
+        ctx.timing[key] += time.perf_counter() - t
+        yield item
+
+
+def safe_read(path: Path, images=False, thumb=True):
     try:
-        return path, read(path, images), None
+        return path, read(path, images, thumb), None
     except Exception as e:  # unreadable/corrupt file
         return path, None, e
 
 
-def batched(items, n):
-    for i in range(0, len(items), n):
-        yield items[i:i + n]
-
-
-def find_channel_images(videos, rep):
+def find_channel_images(videos, rep, first=None):
     """{atom name: image bytes}: the newest video's channel artwork, with older videos opened only for what it lacks.
 
-    `videos` is newest first. Only called when the channel info is being written. Videos are read one at a time and
-    not kept, so memory stays flat however many videos a channel has."""
+    `videos` is newest first. Only called when the channel info is being written. `first` is the newest video's
+    metadata when it was already read with its images. Videos are read one at a time and not kept, so memory
+    stays flat however many videos a channel has."""
     found = {}
-    for p, _ in videos:
+    for number, (p, _) in enumerate(videos):
         if len(found) == len(CHANNEL_IMAGES):
             break
-        _, m, err = safe_read(p, images=True)
+        if number == 0 and first is not None:
+            m, err = first, None
+        else:
+            _, m, err = safe_read(p, images=True)
         if err:
             rep.error(f"cannot read {p}: {err}")
         for atom in CHANNEL_IMAGES:
@@ -525,12 +631,15 @@ def cleanup_channel(folder: Path, videos, ctx: Ctx):
 
 def process_channel(folder: Path, ctx: Ctx, pool):
     args, rep = ctx.args, ctx.rep
-    all_videos = scan_videos(folder)
+    t0 = time.perf_counter()
+    all_videos = scan_videos(folder, pool)
+    ctx.timing["scan"] += time.perf_counter() - t0
     if args.cleanup:
         cleanup_channel(folder, all_videos, ctx)
     if not all_videos:
         return
     ctx.stats["videos"] += len(all_videos)
+    ctx.stats["videos_done"] += len(all_videos)
 
     cutoff = time.time() - args.min_age * 60
     videos = [v for v in all_videos if v[1] <= cutoff]
@@ -541,14 +650,16 @@ def process_channel(folder: Path, ctx: Ctx, pool):
     # Episodes: only videos whose .nfo is missing or older than the .mp4 are opened (in parallel).
     todo = [(p, m) for p, m in videos if args.overwrite or stale(folder / f"{p.stem}.nfo", m)]
     added = any(not (folder / f"{p.stem}.nfo").exists() for p, _ in videos)
-    for chunk in batched([p for p, _ in todo], READ_BATCH):  # read, write and release a batch at a time
-        for path, meta, err in pool.map(safe_read, chunk):
-            if err:
-                rep.error(f"cannot read {path}: {err}")
-            if meta is None:
-                continue
-            ctx.write_xml(folder / f"{path.stem}.nfo", episode_nfo(meta, path.stem), path)
-            ctx.write_image(folder, f"{path.stem}-thumb", meta["thumb"], path)
+    reads = timed(ctx, "wait", prefetch(pool, safe_read, [p for p, _ in todo], ctx.window))
+    for n, (path, meta, err) in enumerate(reads, 1):  # reads run ahead of the writes below
+        ctx.stats["read"] += 1
+        ctx.tick(folder.name, n, len(todo))
+        if err:
+            rep.error(f"cannot read {path}: {err}")
+        if meta is None:
+            continue
+        ctx.write_xml(folder / f"{path.stem}.nfo", episode_nfo(meta, path.stem), path)
+        ctx.write_image(folder, f"{path.stem}-thumb", meta["thumb"], path)
 
     # Channel info: rarely changes, so it is gated on "new video" AND "old enough" (or "incomplete").
     newest_path, newest_mtime = videos[0]
@@ -556,13 +667,13 @@ def process_channel(folder: Path, ctx: Ctx, pool):
     if not (args.overwrite or channel_due(tvshow, folder, newest_mtime, added, args.channel_refresh_days)):
         return
 
-    _, newest, err = safe_read(newest_path)
+    _, newest, err = safe_read(newest_path, images=True)
     if err:
         rep.error(f"cannot read {newest_path}: {err}")
     if newest is None:
         return
     ctx.write_xml(tvshow, tvshow_nfo(newest, folder.name), newest_path)
-    for atom_name, data in find_channel_images(videos, rep).items():
+    for atom_name, data in find_channel_images(videos, rep, newest).items():
         ctx.write_image(folder, CHANNEL_IMAGES[atom_name], data, newest_path)
 
 
@@ -738,6 +849,8 @@ def cleanup_view(show: Path, ids, ctx: Ctx):
             ctx.rep.info(f"remove {f}")
             ctx.stats["removed"] += 1
             removed.add(f)
+            if kind == ".mp4":
+                ctx.links.pop(vid, None)  # no playlist should list it any more
             if not ctx.args.dry_run:
                 try:
                     f.unlink()
@@ -759,7 +872,9 @@ def cleanup_view(show: Path, ids, ctx: Ctx):
 
 def process_channel_view(folder: Path, ctx: Ctx, pool, vindex: ViewIndex):
     args, rep = ctx.args, ctx.rep
-    all_videos = scan_videos(folder)
+    t0 = time.perf_counter()
+    all_videos = scan_videos(folder, pool)
+    ctx.timing["scan"] += time.perf_counter() - t0
     existing = vindex.by_channel.get(folder.name)
     if args.cleanup and existing:
         if all_videos:  # no videos at all could be an unmounted share
@@ -767,6 +882,7 @@ def process_channel_view(folder: Path, ctx: Ctx, pool, vindex: ViewIndex):
     if not all_videos:
         return
     ctx.stats["videos"] += len(all_videos)
+    ctx.stats["videos_done"] += len(all_videos)
 
     cutoff = time.time() - args.min_age * 60
     videos = [v for v in all_videos if v[1] <= cutoff]
@@ -777,13 +893,26 @@ def process_channel_view(folder: Path, ctx: Ctx, pool, vindex: ViewIndex):
     episodes = index_episodes(existing) if existing else {}
 
     # Read only what is new or changed: no link yet, or the view .nfo is older than the TA file.
-    todo = [(p, m) for p, m in videos
-            if args.overwrite or ctx.read_all or p.stem not in episodes
-            or stale(episodes[p.stem][0] / f"{episodes[p.stem][1]}.nfo", m)]
-    todo_set = {p for p, _ in todo}
+    # With --playlists a channel not yet read for playlists is read in full once (see finish_channel_playlists).
+    full_scan = ctx.track_scan and folder.name not in ctx.scanned
+    todo = []  # (path, mtime, needs files written?); a playlist-only re-read of a finished video skips its thumbnail
+    for p, m in videos:
+        needs_files = (args.overwrite or p.stem not in episodes
+                       or stale(episodes[p.stem][0] / f"{episodes[p.stem][1]}.nfo", m))
+        if needs_files or full_scan:
+            todo.append((p, m, needs_files))
+    todo_set = {p for p, _, _ in todo}
 
     newest_path, newest_mtime = videos[0]
-    _, newest, newest_err = safe_read(newest_path)  # without the channel images; they are read at the end if needed
+    # The newest video gives the series info. A new channel also needs its artwork, so that read includes the images
+    # (and doubles as the newest episode's metadata); an existing channel reads them later, only if it is due.
+    images_now = existing is None or not (existing / "tvshow.nfo").exists()
+    newest_future = pool.submit(safe_read, newest_path, images_now)  # first in the queue, ahead of the pipeline
+    reads = timed(ctx, "wait", prefetch(pool, lambda item: safe_read(item[0], False, item[1]),
+                                        [(p, files) for p, _, files in todo if p != newest_path], ctx.window))
+    t0 = time.perf_counter()
+    _, newest, newest_err = newest_future.result()
+    ctx.timing["wait"] += time.perf_counter() - t0
     if newest_err:
         rep.error(f"cannot read {newest_path}: {newest_err}")
     if existing is None:
@@ -803,45 +932,49 @@ def process_channel_view(folder: Path, ctx: Ctx, pool, vindex: ViewIndex):
 
     sidecars = scan_sidecars(folder)
     added = False
-    for chunk in batched(videos, READ_BATCH):  # read, write and release a batch at a time
-        metas = {}
-        for path, meta, err in pool.map(safe_read, [p for p, _ in chunk if p in todo_set]):
-            if err and not (path == newest_path and newest_err):  # that one was reported above
+    # Videos are read ahead in parallel while the loop below writes; `todo` is in the same order as `videos`.
+    for n, (path, mtime) in enumerate(videos, 1):
+        vid = path.stem
+        meta = None
+        if path in todo_set:
+            if path == newest_path:
+                meta, err = newest, None  # read above, with the series info; any error was reported there
+            else:
+                _, meta, err = next(reads)
+            ctx.stats["read"] += 1
+            if err:
                 rep.error(f"cannot read {path}: {err}")
-            metas[path] = meta
             if meta is not None and args.playlists:
                 ctx.collect_playlists(meta, path)
-        for path, mtime in chunk:
-            vid = path.stem
-            meta = metas.get(path)
-            if vid in episodes:
-                sdir, base = episodes[vid]
-            else:
-                if meta is None:
-                    continue
-                sname, stitle = season_folder(meta)
-                sdir, base = show / sname, episode_base(meta, vid)
-                if not args.dry_run:
-                    sdir.mkdir(exist_ok=True)
-                if not (sdir / "season.nfo").exists():
-                    number = int(sname.split()[1])
-                    ctx.write_xml(sdir / "season.nfo", season_nfo(number, stitle), path)
-                episodes[vid] = (sdir, base)
-            ctx.links[vid] = sdir / f"{base}.mp4"
-            if ensure_link(ctx, sdir / f"{base}.mp4", path):
-                added = added or meta is not None
-            for suffix, side in sidecars.get(vid, []):
-                ensure_link(ctx, sdir / f"{base}{suffix}", side)
-            if meta is not None and (args.overwrite or stale(sdir / f"{base}.nfo", mtime)):
-                ctx.write_xml(sdir / f"{base}.nfo", episode_nfo(meta, vid), path)
-                ctx.write_image(sdir, f"{base}-thumb", meta["thumb"], path)
+        ctx.tick(folder.name, n, len(videos))
+        if vid in episodes:
+            sdir, base = episodes[vid]
+        else:
+            if meta is None:
+                continue
+            sname, stitle = season_folder(meta)
+            sdir, base = show / sname, episode_base(meta, vid)
+            if not args.dry_run:
+                sdir.mkdir(exist_ok=True)
+            if not (sdir / "season.nfo").exists():
+                number = int(sname.split()[1])
+                ctx.write_xml(sdir / "season.nfo", season_nfo(number, stitle), path)
+            episodes[vid] = (sdir, base)
+        ctx.links[vid] = sdir / f"{base}.mp4"
+        if ensure_link(ctx, sdir / f"{base}.mp4", path):
+            added = added or meta is not None
+        for suffix, side in sidecars.get(vid, []):
+            ensure_link(ctx, sdir / f"{base}{suffix}", side)
+        if meta is not None and (args.overwrite or stale(sdir / f"{base}.nfo", mtime)):
+            ctx.write_xml(sdir / f"{base}.nfo", episode_nfo(meta, vid), path)
+            ctx.write_image(sdir, f"{base}-thumb", meta["thumb"], path)
 
     if not (args.overwrite or fresh or channel_due(tvshow, show, newest_mtime, added, args.channel_refresh_days)):
         return
     if newest is None:
         return
     ctx.write_xml(tvshow, tvshow_nfo(newest, folder.name), newest_path)
-    for atom_name, data in find_channel_images(videos, rep).items():
+    for atom_name, data in find_channel_images(videos, rep, newest if images_now else None).items():
         ctx.write_image(show, CHANNEL_IMAGES[atom_name], data, newest_path)
 
 
@@ -885,8 +1018,11 @@ def render_playlist(pl, entries, pdir: Path):
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def write_playlists(ctx: Ctx, root: Path):
-    """One .m3u8 per playlist seen this run, listing the episode links that exist, in playlist order."""
+def write_playlists(ctx: Ctx, root: Path, only=None):
+    """One .m3u8 per playlist seen this run (or just those in `only`), listing the episode links that exist, in order."""
+    todo = sorted((pid, pl) for pid, pl in ctx.playlists.items() if only is None or pid in only)
+    if not todo:
+        return
     pdir = root / PLAYLIST_FOLDER
     if (pdir / "tvshow.nfo").exists():
         ctx.rep.error(f"{pdir} is a channel folder; cannot write playlists there")
@@ -897,7 +1033,7 @@ def write_playlists(ctx: Ctx, root: Path):
         except OSError as e:
             ctx.rep.error(f"cannot create {pdir}: {e}")
             return
-    links = {**scan_view_links(root), **ctx.links}
+    links = ctx.links if ctx.links_preloaded else {**scan_view_links(root), **ctx.links}
     known = {}
     taken = set()
     if pdir.is_dir():
@@ -906,7 +1042,7 @@ def write_playlists(ctx: Ctx, root: Path):
             head = playlist_header(f)
             if head:
                 known[head[0]] = (f, head[1])
-    for pid, pl in sorted(ctx.playlists.items()):
+    for pid, pl in todo:
         order = sorted(pl["entries"], key=lambda e: e["idx"] if isinstance(e["idx"], int) else 1 << 30)
         entries = [(e, links[e["id"]]) for e in order if e["id"] in links]
         if not entries:
@@ -929,6 +1065,23 @@ def write_playlists(ctx: Ctx, root: Path):
         except OSError:
             pass
         ctx.write(path, body, pl["ref"])
+
+
+def finish_channel_playlists(ctx: Ctx, root: Path, channel_id: str):
+    """After a channel: write the playlists its videos touched, then remember the channel was read for playlists.
+
+    Doing this per channel (not once at the end) is what lets an interrupted first scan resume where it stopped."""
+    if ctx.dirty:
+        write_playlists(ctx, root, only=set(ctx.dirty))
+        ctx.dirty.clear()
+    if ctx.track_scan and channel_id not in ctx.scanned:
+        ctx.scanned.add(channel_id)
+        if not ctx.args.dry_run:
+            try:
+                with open(root / PLAYLIST_FOLDER / PLAYLIST_SCANNED, "a", encoding="utf-8") as fh:
+                    fh.write(channel_id + "\n")
+            except OSError as e:
+                ctx.rep.error(f"cannot record progress in {root / PLAYLIST_FOLDER}: {e}")
 
 
 def prune_playlists(ctx: Ctx, root: Path):
@@ -978,6 +1131,14 @@ def trigger_refresh(url: str, key: str, rep: Reporter):
         rep.info(f"asked Jellyfin to refresh its library ({url})")
     except Exception as e:
         rep.error(f"could not trigger Jellyfin refresh: {e}")
+
+
+def count_videos(folder: Path):
+    """Number of .mp4 names in a folder, without a stat per file (for the --progress total)."""
+    try:
+        return sum(1 for name in os.listdir(folder) if name.endswith(".mp4"))
+    except OSError:
+        return 0
 
 
 def view_problem(args):
@@ -1032,7 +1193,12 @@ def main(argv=None):
                     help="minimum age of tvshow.nfo before channel info is rebuilt (default %(default)s)")
     ap.add_argument("--min-age", type=float, default=DEFAULT_MIN_AGE_MINUTES, metavar="MINUTES",
                     help="skip videos modified within the last N minutes; 0 disables (default %(default)s)")
-    ap.add_argument("--workers", type=int, default=4, help="parallel file reads (default %(default)s)")
+    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                    help="parallel file reads and stats; on a network share most of the time is waiting for the "
+                         "network, so more helps (default %(default)s)")
+    ap.add_argument("--progress", action="store_true",
+                    help="print a line per channel and a heartbeat every 30 s with the rate and an estimate of "
+                         "the time left, then a breakdown of where the time went; shown even with --quiet")
     ap.add_argument("--no-match-owner", action="store_true",
                     help="do not copy the video's mode and owner onto new files")
     ap.add_argument("--quiet", action="store_true", help="print only errors and the final summary")
@@ -1091,9 +1257,36 @@ def main(argv=None):
         args.view_dir / clean_name(args.view_library) if args.view_library else args.view_dir,
         reserved=(PLAYLIST_FOLDER,) if args.playlists else ())
     if vindex and args.playlists:
-        ctx.read_all = not (vindex.root / PLAYLIST_FOLDER).is_dir()
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        for folder in folders:
+        # The first --playlists scan reads every video once. It is done channel by channel and remembered in
+        # <view>/Playlists/.scanned, so an interrupted scan resumes instead of starting over. A Playlists folder
+        # without that file comes from an older version that finished its scan.
+        pdir = vindex.root / PLAYLIST_FOLDER
+        marker = pdir / PLAYLIST_SCANNED
+        try:
+            if marker.exists():
+                ctx.track_scan = True
+                ctx.scanned = set(marker.read_text(encoding="utf-8").split())
+            elif not pdir.is_dir():
+                ctx.track_scan = True
+                if not args.dry_run:
+                    pdir.mkdir(parents=True, exist_ok=True)
+                    marker.touch()
+        except OSError as e:
+            rep.error(f"cannot use {pdir}: {e}")
+            return 1
+        ctx.links.update(scan_view_links(vindex.root))  # read once; kept up to date as channels are processed
+        ctx.links_preloaded = True
+
+    workers = max(1, args.workers)
+    ctx.window = max(4, 4 * workers)
+    pool = ThreadPoolExecutor(max_workers=workers)
+    interrupted = False
+    try:
+        if args.progress:
+            ctx.total_videos = sum(pool.map(count_videos, folders))
+            rep.progress(f"{len(folders):,} channels, {ctx.total_videos:,} videos to look at, {workers} in parallel")
+        for number, folder in enumerate(folders, 1):
+            started, seen, read = time.monotonic(), ctx.stats["videos_done"], ctx.stats["read"]
             try:
                 if vindex:
                     process_channel_view(folder, ctx, pool, vindex)
@@ -1101,16 +1294,38 @@ def main(argv=None):
                     process_channel(folder, ctx, pool)
             except Exception as e:  # one bad channel must not stop the others
                 rep.error(f"{folder}: {e}")
+            else:
+                if vindex and args.playlists:
+                    finish_channel_playlists(ctx, vindex.root, folder.name)
+            if args.progress:
+                now = time.monotonic()
+                rep.progress(f"[{number}/{len(folders)}] {folder.name}: {ctx.stats['videos_done'] - seen:,} videos, "
+                             f"{ctx.stats['read'] - read:,} read, {fmt_duration(now - started)}; {ctx.rate_text(now)}")
+    except KeyboardInterrupt:
+        interrupted = True
+        rep.summary("interrupted: stopping cleanly. Files already written are complete; run the same command "
+                    "again to carry on where this stopped.")
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
     if vindex and args.playlists:
-        write_playlists(ctx, vindex.root)
-        if args.cleanup:
+        write_playlists(ctx, vindex.root, only=set(ctx.dirty) if interrupted else None)
+        if args.cleanup and not interrupted:
             prune_playlists(ctx, vindex.root)
 
     s = ctx.stats
-    rep.summary(f"done: {s['videos']} videos seen, {s['written']} files written, {s['removed']} removed"
+    rep.summary(f"{'stopped' if interrupted else 'done'}: {s['videos']} videos seen, {s['written']} files written, "
+                f"{s['removed']} removed"
                 + (f", {s['deferred']} skipped as too new" if s["deferred"] else "")
                 + (f", {rep.errors} errors" if rep.errors else ""))
+    if args.progress:
+        wall = time.monotonic() - ctx.started
+        other = max(wall - ctx.timing["scan"] - ctx.timing["wait"], 0)
+        rep.progress(f"time: {fmt_duration(wall)} in total = {fmt_duration(ctx.timing['scan'])} listing and checking "
+                     f"file dates + {fmt_duration(ctx.timing['wait'])} waiting for tag reads + "
+                     f"{fmt_duration(other)} everything else (writing files and links); {s['read']:,} videos read")
+    if interrupted:
+        return 130
 
     if args.jellyfin_url and args.jellyfin_api_key and not args.dry_run and (s["written"] or s["removed"]):
         trigger_refresh(args.jellyfin_url, args.jellyfin_api_key, rep)
