@@ -3,6 +3,7 @@
 Fixtures are tiny hand-built MP4 containers (ftyp/moov/udta/meta/ilst/mdat), so no real video or
 ffmpeg is needed.
 """
+import collections
 import contextlib
 import datetime
 import http.server
@@ -19,6 +20,7 @@ import tracemalloc
 import time
 import unittest
 from unittest import mock
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -512,8 +514,9 @@ class ViewModeTests(ViewBase):
     def test_a_run_stopped_partway_leaves_a_folder_the_next_run_reuses(self):
         self.video("aaaaaaaaaaa", mp4_bytes(full_items()))
         with mock.patch.object(ta_nfo, "ensure_link", side_effect=KeyboardInterrupt):  # the stop, before any episode
-            with self.assertRaises(KeyboardInterrupt):
-                self.vrun()
+            code, out, _ = self.vrun()
+        self.assertEqual(code, 130)  # Ctrl-C stops cleanly with a summary instead of a traceback
+        self.assertIn("interrupted", out)
         self.assertTrue((self.show / "tvshow.nfo").exists())
         self.vrun()
         self.assertEqual([p.name for p in self.view.iterdir()], ["NBC News"])
@@ -789,6 +792,182 @@ class PlaylistTests(ViewBase):
         self.assertTrue((self.pdir / "Mix.m3u8").exists())
         self.assertFalse((self.pdir / "tvshow.nfo").exists())
         self.assertTrue(any(p.name.startswith("Playlists [") for p in self.view.iterdir()))
+
+
+class SpeedAndResumeTests(ViewBase):
+    """The read pipeline, parallel stats, --progress, and resuming an interrupted first --playlists scan."""
+
+    OTHER = "UC" + "z" * 22  # sorts after CHAN, so it is the second channel processed
+
+    def two_channels(self):
+        both = [playlist(entries=["aaaaaaaaaaa", "bbbbbbbbbbb"])]
+        self.video("aaaaaaaaaaa", mp4_bytes(full_items(both)))
+        other = self.lib / self.OTHER
+        other.mkdir()
+        (other / "bbbbbbbbbbb.mp4").write_bytes(mp4_bytes(full_items(both)))
+
+    def read_counts(self):
+        """Context manager result: {channel folder name: number of tag reads} while it is active."""
+        counts = collections.Counter()
+        real = ta_nfo.read_tags
+
+        def spy(path, skip=()):
+            counts[Path(path).parent.name] += 1
+            return real(path, skip=skip)
+        return counts, mock.patch.object(ta_nfo, "read_tags", spy)
+
+    def test_prefetch_keeps_order_and_stays_within_the_window(self):
+        running, peak = 0, 0
+        lock = threading.Lock()
+
+        def work(n):
+            nonlocal running, peak
+            with lock:
+                running += 1
+                peak = max(peak, running)
+            time.sleep(0.002)
+            with lock:
+                running -= 1
+            return n * 2
+
+        started = []
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            def tracked(n):
+                started.append(n)
+                return work(n)
+            consumed = []
+            for result in ta_nfo.prefetch(pool, tracked, range(50), 5):
+                consumed.append(result)
+                # never more than the window ahead of what was consumed (plus the one just handed over)
+                self.assertLessEqual(len(started) - len(consumed), 5)
+        self.assertEqual(consumed, [n * 2 for n in range(50)])
+        self.assertLessEqual(peak, 5)
+
+    def test_prefetch_stops_cleanly_when_the_consumer_gives_up(self):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            gen = ta_nfo.prefetch(pool, lambda n: n, range(1000), 4)
+            self.assertEqual(next(gen), 0)
+            gen.close()  # the cancel in its finally must not raise or hang
+
+    def test_scan_videos_gives_the_same_answer_with_and_without_a_pool(self):
+        for i in range(80):
+            self.video(f"v{i:010d}", b"x", age_days=i % 7)
+        (self.ch / "notavideo.txt").write_text("x")
+        plain = ta_nfo.scan_videos(self.ch)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            parallel = ta_nfo.scan_videos(self.ch, pool)
+        self.assertEqual(len(plain), 80)
+        self.assertEqual(plain, parallel)
+
+    def test_default_worker_count_is_higher_than_the_old_four(self):
+        self.assertGreaterEqual(ta_nfo.DEFAULT_WORKERS, 16)
+
+    def test_reading_still_works_where_posix_fadvise_is_missing_or_fails(self):
+        video = self.video("aaaaaaaaaaa", mp4_bytes(full_items()))
+        with mock.patch.object(os, "posix_fadvise", side_effect=OSError("no")):
+            self.assertIn("ta", ta_nfo.read_tags(video))
+        with mock.patch.object(os, "posix_fadvise", side_effect=AttributeError):
+            self.assertIn("ta", ta_nfo.read_tags(video))
+
+    def test_progress_lines_and_time_breakdown(self):
+        self.two_channels()
+        code, out, err = self.vrun("--progress", "--quiet")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("2 channels, 2 videos to look at", out)
+        self.assertIn("[1/2]", out)
+        self.assertIn("[2/2]", out)
+        self.assertRegex(out, r"time: \d+s in total = .* listing .* waiting for tag reads .* everything else")
+        self.assertIn("2 videos read", out)
+
+    def test_duration_text(self):
+        self.assertEqual(ta_nfo.fmt_duration(7), "7s")
+        self.assertEqual(ta_nfo.fmt_duration(61), "1m01s")
+        self.assertEqual(ta_nfo.fmt_duration(3661), "1h01m")
+        self.assertEqual(ta_nfo.fmt_duration(20 * 3600), "20h00m")
+
+    def interrupt_second_channel(self):
+        real = ta_nfo.process_channel_view
+        calls = []
+
+        def flaky(folder, ctx, pool, vindex):
+            calls.append(folder.name)
+            if len(calls) == 2:
+                raise KeyboardInterrupt
+            return real(folder, ctx, pool, vindex)
+        return mock.patch.object(ta_nfo, "process_channel_view", flaky)
+
+    def test_an_interrupted_first_playlist_scan_resumes_instead_of_starting_over(self):
+        self.two_channels()
+        pdir = self.view / "Playlists"
+        with self.interrupt_second_channel():
+            code, out, _ = self.vrun("--playlists")
+        self.assertEqual(code, 130)
+        self.assertIn("interrupted", out)
+        # channel 1 is finished and remembered; its playlist file was written before the stop
+        self.assertEqual((pdir / ".scanned").read_text().split(), [CHAN])
+        (mix,) = pdir.glob("*.m3u8")
+        self.assertEqual(len(ListEntries.of(mix)), 1)
+        # the second run reads channel 2 in full, and channel 1 only for its newest video (the series info)
+        counts, patch = self.read_counts()
+        with patch:
+            code, _, err = self.vrun("--playlists")
+        self.assertEqual((code, err), (0, ""))
+        # a new channel's newest video is opened once: series info, artwork and episode metadata in one read
+        self.assertEqual(counts[self.OTHER], 1)
+        self.assertEqual(counts[CHAN], 1)        # only the newest video: nothing is read again
+        self.assertEqual(sorted((pdir / ".scanned").read_text().split()), sorted([CHAN, self.OTHER]))
+        self.assertEqual(len(ListEntries.of(mix)), 2)  # both videos, now that channel 2 has been read
+
+    def test_a_playlist_only_re_read_skips_the_thumbnail_and_changes_no_file(self):
+        both = [playlist(entries=["aaaaaaaaaaa", "bbbbbbbbbbb"])]
+        self.video("aaaaaaaaaaa", mp4_bytes(full_items(both)))
+        self.video("bbbbbbbbbbb", mp4_bytes(full_items(both)), age_days=1)  # older, so not the newest video
+        self.vrun()  # a view built without --playlists: both videos are finished
+        before = sorted((str(p.relative_to(self.view)), p.stat().st_mtime_ns)
+                        for p in self.view.rglob("*") if p.is_file() and not p.is_symlink())
+        skips = {}
+        real = ta_nfo.read_tags
+
+        def spy(path, skip=()):
+            skips[Path(path).stem] = set(skip)
+            return real(path, skip=skip)
+        with mock.patch.object(ta_nfo, "read_tags", spy):
+            code, _, err = self.vrun("--playlists")
+        self.assertEqual((code, err), (0, ""))
+        self.assertNotIn("covr", skips["aaaaaaaaaaa"])  # the newest video is read in full for the series info
+        self.assertIn("covr", skips["bbbbbbbbbbb"])     # a finished video is only read for its playlists
+        after = sorted((str(p.relative_to(self.view)), p.stat().st_mtime_ns)
+                       for p in self.view.rglob("*") if p.is_file() and not p.is_symlink()
+                       if "Playlists" not in p.parts)
+        self.assertEqual([x for x in before if "Playlists" not in x[0]], after)  # no episode file was rewritten
+        (mix,) = (self.view / "Playlists").glob("*.m3u8")
+        self.assertEqual(len(ListEntries.of(mix)), 2)
+
+    def test_a_finished_scan_reads_nothing_more_on_the_next_run(self):
+        self.two_channels()
+        self.vrun("--playlists")
+        counts, patch = self.read_counts()
+        with patch:
+            code, out, _ = self.vrun("--playlists")
+        self.assertEqual(code, 0)
+        self.assertIn("0 files written", out)
+        self.assertEqual(sum(counts.values()), 2)  # just each channel's newest video
+
+    def test_a_playlists_folder_from_an_older_version_counts_as_a_finished_scan(self):
+        self.two_channels()
+        self.vrun()  # a view built without playlists
+        (self.view / "Playlists").mkdir()  # what 0.3.0 to 0.4.2 left behind after a full scan
+        counts, patch = self.read_counts()
+        with patch:
+            self.vrun("--playlists")
+        self.assertFalse((self.view / "Playlists" / ".scanned").exists())
+        self.assertEqual(sum(counts.values()), 2)  # no full re-read
+
+
+class ListEntries:
+    @staticmethod
+    def of(path):
+        return [ln for ln in path.read_text(encoding="utf-8").splitlines() if not ln.startswith("#")]
 
 
 class MemoryTests(ViewBase):

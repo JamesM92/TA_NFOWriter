@@ -156,6 +156,8 @@ Rules:
 | `--in-place` | Skip view mode and write NFOs and artwork next to the videos, inside the TubeArchivist folder (it must be writable). Gives ID-only names and no season folders. Cannot be combined with the view options. |
 | `--view-library NAME` | Put the channels in a folder of this name inside the view. Default: none, the channels sit directly in the view. Use it when a program expects a fixed top folder such as `tvseries`. |
 | `--link-type symlink\|hard` | Default `symlink`. `hard` needs the view on the same filesystem as the library, and keeps the data on disk after TubeArchivist deletes a video. A container then needs only the view folder. |
+| `--workers N` | Parallel file reads and file-date checks (default 16). On a network share nearly all the time is spent waiting for the network, so more is faster; see "Large libraries and slow shares". |
+| `--progress` | Print a line per channel and a heartbeat every 30 seconds with the rate and an estimate of the time left, then a breakdown of where the time went. Shown even with `--quiet`. |
 | `--version` | Print the version and exit. Useful for checking which copy of the script you are running. |
 | `--playlists` | Also write one `.m3u8` playlist per TubeArchivist playlist into `<view>/Playlists/`. See "Playlists". View mode only. |
 | `--link-root PATH` | Write symlink targets as `PATH/<channel id>/<id>.mp4`. Only for a container that cannot mount the library at the host path. The links are then valid inside that container only. |
@@ -177,10 +179,19 @@ With `--playlists`, the tool also writes one standard `.m3u8` playlist file per 
 ```
 
 - The files list only videos that exist in the view, in the playlist's order, with paths relative to the `Playlists` folder. Any program that reads `.m3u8` files can use them, for example VLC or Kodi. Jellyfin does not turn them into its own playlists.
-- The data is a snapshot taken when TubeArchivist last embedded each video. A change to a playlist in TubeArchivist reaches the file after its videos are re-embedded, because only videos that are new or changed are read. The first `--playlists` run on a view reads every video once to find the playlists; the `Playlists` folder marks that this was done.
+- The data is a snapshot taken when TubeArchivist last embedded each video. A change to a playlist in TubeArchivist reaches the file after its videos are re-embedded, because only videos that are new or changed are read. The first `--playlists` run on a view reads every video once to find the playlists. That scan is recorded channel by channel in `Playlists/.scanned` and each channel's playlists are written as soon as the channel is done, so an interrupted scan carries on with the unfinished channels instead of starting over. A finished video is read again only for its small `ta` tag, not its thumbnail. A `Playlists` folder without a `.scanned` file comes from an older version that finished its scan, and counts as done.
 - Playlist file names follow the first-name-wins rule. Two playlists with the same name get a short ID added. A channel named `Playlists` is given an ID suffix so the two do not clash.
 - `--cleanup` also removes entries whose video link is gone from files this tool wrote, and removes a playlist left empty. It never touches `.m3u8` files it did not write.
 - Off by default, and not available with `--in-place`.
+
+## Large libraries and slow shares
+
+The first run reads every video once. That is mostly waiting for the network: each video takes about 14 small reads and 120 KB of data for a typical TubeArchivist file, and each read is a round trip to the share. So:
+
+- **Use `--progress` for a big first run.** It prints the total up front, a line per channel, a heartbeat every 30 seconds with the rate and an estimate of the time left, and at the end a breakdown: time listing and checking file dates, time waiting for tag reads, and time spent writing files and links. Within a minute you know whether the run will take minutes or hours. Add `--quiet` to hide the per-file lines, which for hundreds of thousands of videos are only noise: `python3 ta_nfo.py /path/to/library --progress --quiet`.
+- **Raise `--workers` if the time goes on "waiting for tag reads".** The default is 16. A share that answers slowly keeps getting faster with more, until the server or the network is the limit: try `--workers 32` or `64` and watch the videos-per-second rate. In a simulation with a 60 ms delay per read, 4 workers (the old default) did about 9 videos per second, 16 about 37, and 32 about 70. Each worker holds a file open on the share, so stop going up if the server starts to struggle or to refuse connections.
+- **Stopping is safe.** Press Ctrl-C and the tool finishes the files it is writing, prints a summary and exits with status 130. Every file is written atomically, and the next run carries on: a video is read again only if its NFO is missing or older than the video, so finished videos cost one file-date check each. A channel folder is recognised from its `tvshow.nfo`, which is written before the channel's first episode, so a stopped run does not leave a duplicate `Channel [ID]` folder behind.
+- **Do the big first run without `--playlists` if you can.** Then add `--playlists` for a second pass: it reads each finished video only for its playlists, and that pass is recorded per channel and resumes too.
 
 ## Running it daily from cron
 
@@ -198,7 +209,7 @@ With `--playlists`, the tool also writes one standard `.m3u8` playlist file per 
 | Ownership | New files copy the video's permissions and, when allowed, its owner and group, so Jellyfin can read them. Disable with `--no-match-owner`. Only root can change ownership; otherwise files belong to the cron user. |
 | Safe writes | Files are written to a temp name and renamed into place. |
 | Exit status | `1` if any file could not be read, written, removed, or the Jellyfin refresh failed; `0` otherwise. Errors go to stderr (cron mails them). `--quiet` prints only errors and the summary; `--log FILE` also appends to a file. |
-| Parallel reads | `--workers N` (default 4) reads changed files in parallel. This mainly helps on slow network storage. |
+| Parallel reads | `--workers N` (default 16) reads files and checks file dates in parallel, and the reads run ahead of the writing. This mainly helps on slow network storage; see "Large libraries and slow shares". |
 | Optional Jellyfin rescan | `--jellyfin-url` and `--jellyfin-api-key` (or `JELLYFIN_URL` / `JELLYFIN_API_KEY`) ask Jellyfin to refresh its library after a run that changed files. Not yet tried against a real Jellyfin server. |
 
 Freshness is based on modification times, so a restore or copy that gives files new timestamps makes the next run rebuild them; `cp -p` and `rsync -t` preserve them. Re-running TubeArchivist's embed action also triggers a rebuild, which is what you want.

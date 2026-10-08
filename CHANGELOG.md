@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+- `--progress`: the total up front, a line per channel, a heartbeat every 30 seconds with the rate and an estimate of the time left, and at the end a breakdown of where the time went (listing and file dates, waiting for tag reads, everything else). Shown even with `--quiet`.
+- Ctrl-C stops cleanly: the tool prints a summary and exits with status 130, and the next run carries on.
+
+### Changed
+- **Much faster first runs on a network share.** The default for `--workers` is now 16 (it was 4). Tag reads run ahead of the writing instead of in batches that the writer waits for, the file dates of a channel's videos are checked in parallel, files are opened with a random-access hint so the kernel does not read ahead megabytes of a file we jump around in, and a new channel's newest video is opened once instead of three times. In a simulation with a 60 ms delay per network read, the same library went from about 9 videos per second to about 37 with the default and about 70 with `--workers 32`.
+- The `--playlists` scan of videos that are already finished reads only their small `ta` tag, not the 60 to 90 KB thumbnail.
+
+### Fixed
+- An interrupted first `--playlists` scan no longer starts over. The scan is recorded per channel in `Playlists/.scanned`, and each channel's playlists are written when the channel is done. Before, the only record was a folder created at the very end, so a stopped scan re-read every video and lost the playlist data it had collected. A `Playlists` folder from an older version, without that file, counts as a finished scan.
+
 ## [0.4.2] - 2026-10-05
 
 ### Fixed
