@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-08
+
 ### Added
 - `--progress`: the total up front, a line per channel, a heartbeat every 30 seconds with the rate and an estimate of the time left, and at the end a breakdown of where the time went (listing and file dates, waiting for tag reads, everything else). Shown even with `--quiet`.
 - Ctrl-C stops cleanly: the tool prints a summary and exits with status 130, and the next run carries on.
