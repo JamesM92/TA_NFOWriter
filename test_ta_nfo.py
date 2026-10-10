@@ -843,6 +843,66 @@ class UnreadableVideoTests(Base):
         self.assertIn("last modified 72h00m ago", str(trunc))
         self.assertIn("the file is empty (0 bytes)", str(empty))
 
+    @staticmethod
+    def growing_read(real, stems, error=ValueError):
+        """A read() that fails for the named videos and, like a download in progress, makes them bigger each time."""
+        def fake(path, images=False, thumb=True):
+            if Path(path).stem in stems:
+                with open(path, "ab") as fh:
+                    fh.write(b"x" * 100)
+                raise error("not a readable MP4 (no moov box)")
+            return real(path, images, thumb)
+        return fake
+
+    def test_a_file_that_grows_between_the_attempts_is_still_being_written(self):
+        video = self.video("aaaaaaaaaaa", mp4_bytes(full_items())[:60])
+        with mock.patch.object(ta_nfo, "read", self.growing_read(ta_nfo.read, {"aaaaaaaaaaa"})):
+            _, meta, err = ta_nfo.safe_read(video)
+        self.assertIsNone(meta)
+        self.assertIsInstance(err, ta_nfo.StillWriting)
+        self.assertIn("bytes", str(err))
+
+    def test_a_file_that_stays_the_same_size_is_just_unreadable(self):
+        video = self.video("aaaaaaaaaaa", mp4_bytes(full_items())[:60])
+        _, meta, err = ta_nfo.safe_read(video)
+        self.assertIsNone(meta)
+        self.assertNotIsInstance(err, ta_nfo.StillWriting)
+        self.assertIsInstance(err, ValueError)
+
+    def test_an_io_error_is_not_mistaken_for_a_growing_file(self):
+        video = self.video("aaaaaaaaaaa", mp4_bytes(full_items())[:60])
+        with mock.patch.object(ta_nfo, "read", self.growing_read(ta_nfo.read, {"aaaaaaaaaaa"}, OSError)):
+            _, _, err = ta_nfo.safe_read(video)
+        self.assertIsInstance(err, OSError)
+        self.assertNotIsInstance(err, ta_nfo.StillWriting)
+
+    def test_a_growing_video_is_skipped_quietly_and_picked_up_later(self):
+        self.video("aaaaaaaaaaa", mp4_bytes(full_items()))
+        self.video("bbbbbbbbbbb", mp4_bytes(full_items())[:60])
+        with mock.patch.object(ta_nfo, "read", self.growing_read(ta_nfo.read, {"bbbbbbbbbbb"})):
+            code, out, err = run(self.lib, "--in-place")
+        self.assertEqual(code, 0)
+        self.assertNotIn("warning:", err)  # still being written is not a problem worth a warning
+        self.assertNotIn("unreadable", out)
+        self.assertIn("1 skipped as too new", out)
+        self.assertTrue((self.ch / "aaaaaaaaaaa.nfo").exists())
+        self.assertFalse((self.ch / "bbbbbbbbbbb.nfo").exists())
+        # the download finishes; the next run reads it
+        self.video("bbbbbbbbbbb", mp4_bytes(full_items()))
+        code, _, err = run(self.lib, "--in-place")
+        self.assertEqual((code, err), (0, ""))
+        self.assertTrue((self.ch / "bbbbbbbbbbb.nfo").exists())
+
+    def test_many_growing_videos_do_not_trip_the_too_many_unreadable_guard(self):
+        stems = {f"grow{i:07d}" for i in range(12)}
+        for stem in stems:
+            self.video(stem, mp4_bytes(full_items())[:60])
+        self.video("aaaaaaaaaaa", mp4_bytes(full_items()))
+        with mock.patch.object(ta_nfo, "read", self.growing_read(ta_nfo.read, stems)):
+            code, out, err = run(self.lib, "--in-place")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("12 skipped as too new", out)
+
     def test_a_video_that_cannot_be_opened_at_all_is_still_an_error(self):
         self.video("aaaaaaaaaaa", mp4_bytes(full_items()))
         self.video("bbbbbbbbbbb", mp4_bytes(full_items()))

@@ -436,6 +436,7 @@ class Ctx:
         self.dirty = set()  # playlist ids collected or changed since their file was last written
         self.links_preloaded = False  # ctx.links already holds every episode link in the view (--playlists)
         self.unreadable = {}  # video path -> why it is not a usable MP4; warnings, not errors (see read_failed)
+        self.growing = set()  # videos skipped because their size changed while we looked: still being written
         self.window = 4 * DEFAULT_WORKERS  # reads allowed to run ahead of the writer
         self.timing = {"scan": 0.0, "wait": 0.0}
         self.stats["read"] = 0  # videos whose tags were read
@@ -460,7 +461,12 @@ class Ctx:
         """A video could not be read. If the file was read but is not a usable MP4 (cut off, empty, bad structure) that is
         a warning: the video is skipped and tried again next run, and one broken file must not turn every run red. If it
         could not be read at all (permission denied, I/O error, the share gone) it is an error."""
-        if isinstance(err, (ValueError, struct.error)):
+        if isinstance(err, StillWriting):
+            if path not in self.growing:  # not a problem at all: it is picked up once the download or copy is done
+                self.growing.add(path)
+                self.stats["deferred"] += 1
+                self.rep.info(f"skipped {path}: still being written ({err})")
+        elif isinstance(err, (ValueError, struct.error)):
             if path not in self.unreadable:
                 self.unreadable[path] = str(err)
                 self.rep.warning(f"cannot read {path}: {err}")
@@ -579,16 +585,35 @@ def timed(ctx, key, results):
 RETRY_DELAY = 0.5  # seconds before the one retry of a read that failed
 
 
+class StillWriting(ValueError):
+    """The video is not a usable MP4 yet, and it got bigger between two attempts: a download or copy is in progress."""
+
+
+def file_size(path):
+    try:
+        return os.stat(path).st_size
+    except OSError:
+        return None
+
+
 def safe_read(path: Path, images=False, thumb=True):
     """(path, metadata, None) or (path, None, error). A failed read is tried once more after a short pause: a busy
-    network share can return a short read or an error once, and that must not look like a corrupt video."""
+    network share can return a short read or an error once, and that must not look like a corrupt video. If the
+    file is not a usable MP4 and its size changed between the two attempts, it is still being written, which is
+    returned as a StillWriting error (a file's date cannot be trusted for this: a move can keep the old date)."""
+    size = None
     for attempt in (1, 2):
         try:
             return path, read(path, images, thumb), None
         except (ValueError, OSError, struct.error) as e:  # unreadable, truncated or a hiccup on the share
-            if attempt == 2:
-                return path, None, e
-            time.sleep(RETRY_DELAY)
+            if attempt == 1:
+                size = file_size(path) if isinstance(e, (ValueError, struct.error)) else None
+                time.sleep(RETRY_DELAY)
+                continue
+            now = file_size(path)
+            if size is not None and now is not None and now != size and isinstance(e, (ValueError, struct.error)):
+                return path, None, StillWriting(f"{size:,} bytes, then {now:,} bytes {RETRY_DELAY:g} s later")
+            return path, None, e
         except Exception as e:  # anything else is a bug or a corrupt file; do not retry
             return path, None, e
 
