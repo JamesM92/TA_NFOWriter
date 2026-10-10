@@ -686,7 +686,7 @@ def cleanup_channel(folder: Path, videos, ctx: Ctx):
 
 
 def process_channel(folder: Path, ctx: Ctx, pool):
-    args, rep = ctx.args, ctx.rep
+    args = ctx.args
     t0 = time.perf_counter()
     all_videos = scan_videos(folder, pool)
     ctx.timing["scan"] += time.perf_counter() - t0
@@ -928,7 +928,7 @@ def cleanup_view(show: Path, ids, ctx: Ctx):
 
 
 def process_channel_view(folder: Path, ctx: Ctx, pool, vindex: ViewIndex):
-    args, rep = ctx.args, ctx.rep
+    args = ctx.args
     t0 = time.perf_counter()
     all_videos = scan_videos(folder, pool)
     ctx.timing["scan"] += time.perf_counter() - t0
