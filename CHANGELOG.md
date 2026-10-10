@@ -7,6 +7,7 @@
 - The same unreadable video is reported once per run, not once for each step that touched it (in-place mode reported it twice).
 
 ### Changed
+- **A video that is not a usable MP4 is now a warning, not an error.** A cut-off, empty or half-downloaded file used to make the whole run exit 1, so one permanently broken video kept cron and monitoring red on every run and could hide a real failure. Such a video is now skipped with a `warning:` line, listed in a recap at the end (and counted as "unreadable" in the summary line), and tried again next run; the exit status stays 0. These are still errors with exit 1: a file that cannot be opened at all (permission denied, I/O error, the share gone), and too many unreadable videos (at least 10 and more than 5 percent of those read), which points at a wrong folder or a sick share.
 - A video whose read fails is retried once after a short pause before it is reported. A busy network share can return a short read or an error once, which looked like a corrupt file ("no moov box").
 - The unreadable-video message now says what was found: the file size or that it is empty, and how long ago it was last modified.
 

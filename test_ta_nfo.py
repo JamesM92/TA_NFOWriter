@@ -238,20 +238,25 @@ class OutputTests(Base):
         _, out, _ = run(self.lib)
         self.assertIn("aaaaaaaaaaa.nfo", out)
 
-    def test_corrupt_file_is_reported_and_does_not_stop_the_rest(self):
+    def test_corrupt_file_is_a_warning_and_does_not_stop_the_rest(self):
         self.video("aaaaaaaaaaa", b"not an mp4 at all")
         self.video("bbbbbbbbbbb", mp4_bytes(full_items()))
         code, _, err = run(self.lib)
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 0)  # a broken video is a warning, not a failed run
+        self.assertIn("warning: cannot read", err)
+        self.assertNotIn("error:", err)
         self.assertIn("aaaaaaaaaaa.mp4", err)
         self.assertFalse((self.ch / "aaaaaaaaaaa.nfo").exists())  # no empty NFO for an unreadable file
         self.assertTrue((self.ch / "bbbbbbbbbbb.nfo").exists())
 
     def test_truncated_file_is_reported(self):
         self.video("aaaaaaaaaaa", mp4_bytes(full_items())[:60])
-        code, _, err = run(self.lib)
-        self.assertEqual(code, 1)
-        self.assertIn("cannot read", err)
+        code, out, err = run(self.lib)
+        self.assertEqual(code, 0)
+        self.assertIn("warning: cannot read", err)
+        self.assertIn("1 unreadable", out)  # in the summary line
+        self.assertIn("warning: 1 video was not a readable MP4", out)  # and a recap at the end
+        self.assertIn("aaaaaaaaaaa.mp4", out)
 
     def test_valid_mp4_with_no_tags_is_not_an_error(self):
         self.video("aaaaaaaaaaa", mp4_bytes([text_atom("©too", "Lavf63.6.100")]))
@@ -838,12 +843,48 @@ class UnreadableVideoTests(Base):
         self.assertIn("last modified 72h00m ago", str(trunc))
         self.assertIn("the file is empty (0 bytes)", str(empty))
 
-    def test_one_bad_video_is_one_error_and_the_rest_still_get_their_files(self):
+    def test_a_video_that_cannot_be_opened_at_all_is_still_an_error(self):
+        self.video("aaaaaaaaaaa", mp4_bytes(full_items()))
+        self.video("bbbbbbbbbbb", mp4_bytes(full_items()))
+        real = ta_nfo.read
+
+        def denied(path, images=False, thumb=True):
+            if Path(path).stem == "bbbbbbbbbbb":
+                raise PermissionError(13, "Permission denied")
+            return real(path, images, thumb)
+        with mock.patch.object(ta_nfo, "read", denied):
+            code, _, err = run(self.lib, "--in-place")
+        self.assertEqual(code, 1)  # permissions or a sick share are a real problem
+        self.assertIn("error: cannot read", err)
+        self.assertTrue((self.ch / "aaaaaaaaaaa.nfo").exists())
+
+    def test_too_many_unreadable_videos_is_an_error(self):
+        for i in range(12):  # 12 of 14: this is not a few broken files, it is the wrong folder or a bad share
+            self.video(f"bad{i:08d}", b"not an mp4")
+        self.video("aaaaaaaaaaa", mp4_bytes(full_items()))
+        self.video("bbbbbbbbbbb", mp4_bytes(full_items()))
+        code, out, err = run(self.lib, "--in-place")
+        self.assertEqual(code, 1)
+        self.assertIn("too many to be a few broken files", err)
+        self.assertIn("12 unreadable", out)
+
+    def test_a_few_unreadable_videos_among_many_stay_a_warning(self):
+        for i in range(12):
+            self.video(f"bad{i:08d}", b"not an mp4")
+        for i in range(400):  # 12 of 412 is under 5 percent
+            self.video(f"ok{i:09d}", mp4_bytes(full_items()))
+        code, out, err = run(self.lib, "--in-place", "--quiet")
+        self.assertEqual(code, 0)
+        self.assertIn("12 unreadable", out)
+        self.assertIn("... and 2 more", out)  # the recap lists ten and counts the rest
+
+    def test_one_bad_video_is_one_warning_and_the_rest_still_get_their_files(self):
         self.video("aaaaaaaaaaa", mp4_bytes(full_items()))
         self.video("bbbbbbbbbbb", mp4_bytes(full_items())[:60])
         code, out, err = run(self.lib, "--in-place")
-        self.assertEqual(code, 1)
-        self.assertEqual(err.count("error:"), 1)
+        self.assertEqual(code, 0)
+        self.assertEqual(err.count("warning:"), 1)
+        self.assertNotIn("error:", err)
         self.assertIn("bbbbbbbbbbb.mp4", err)
         self.assertTrue((self.ch / "aaaaaaaaaaa.nfo").exists())
         self.assertFalse((self.ch / "bbbbbbbbbbb.nfo").exists())
@@ -859,8 +900,8 @@ class UnreadableNewestVideoTests(ViewBase):
     def test_a_new_channel_is_built_from_the_next_readable_video(self):
         self.setup_videos()
         code, _, err = self.vrun()
-        self.assertEqual(code, 1)
-        self.assertEqual(err.count("error:"), 1)  # reported once, not once per step that touched it
+        self.assertEqual(code, 0)
+        self.assertEqual(err.count("warning:"), 1)  # reported once, not once per step that touched it
         self.assertIn("bbbbbbbbbbb.mp4", err)
         self.assertTrue((self.show / "tvshow.nfo").exists())
         for name in ("poster.jpg", "banner.jpg", "fanart.jpg"):
@@ -881,19 +922,19 @@ class UnreadableNewestVideoTests(ViewBase):
     def test_in_place_the_channel_info_comes_from_the_next_readable_video(self):
         self.setup_videos()
         code, _, err = run(self.lib, "--in-place")
-        self.assertEqual(code, 1)
-        self.assertEqual(err.count("error:"), 1)
+        self.assertEqual(code, 0)
+        self.assertEqual(err.count("warning:"), 1)
         self.assertTrue((self.ch / "tvshow.nfo").exists())
         self.assertTrue((self.ch / "poster.jpg").exists())
         self.assertTrue((self.ch / "aaaaaaaaaaa.nfo").exists())
         self.assertFalse((self.ch / "bbbbbbbbbbb.nfo").exists())
 
-    def test_every_video_unreadable_gives_one_error_each_and_no_channel_info(self):
+    def test_every_video_unreadable_gives_one_warning_each_and_no_channel_info(self):
         self.video("aaaaaaaaaaa", mp4_bytes(full_items())[:60], age_days=1)
         self.video("bbbbbbbbbbb", mp4_bytes(full_items())[:60])
         code, _, err = self.vrun()
-        self.assertEqual(code, 1)
-        self.assertEqual(err.count("error:"), 2)
+        self.assertEqual(code, 0)  # only two: a few broken files, not a systemic problem
+        self.assertEqual(err.count("warning:"), 2)
         self.assertEqual(list(self.view.iterdir()), [])
 
 
