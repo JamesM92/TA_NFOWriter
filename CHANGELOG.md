@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-10
+
 ### Fixed
 - **An unreadable newest video no longer blocks its channel.** The series info (`tvshow.nfo` and the artwork) comes from the channel's newest video. When that video could not be read, for example a half-downloaded upload, a new channel was skipped completely on every run, and an existing channel's series info stopped updating. The next few videos are now tried, so the channel is built from the newest one that can be read.
 - The same unreadable video is reported once per run, not once for each step that touched it (in-place mode reported it twice).

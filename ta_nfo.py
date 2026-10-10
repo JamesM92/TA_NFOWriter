@@ -48,7 +48,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-__version__ = "0.5.0"  # bumped in the release commit; the dev branch keeps the last released value
+__version__ = "0.5.1"  # bumped in the release commit; the dev branch keeps the last released value
 
 CHANNEL_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
 VIDEO_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
