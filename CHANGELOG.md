@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-10
+
 ### Added
 - A video that is still being downloaded or copied is recognised by its size, not its date. If a video is not a usable MP4 and its size changed between the tool's two attempts to read it, it is skipped quietly (no warning, counted under "skipped as too new") and picked up on a later run. The date check (`--min-age`) can miss such a file when it was moved in from a cache and kept its old date, which used to produce a warning about an unreadable video.
 
