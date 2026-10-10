@@ -25,6 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import ta_nfo  # noqa: E402
+ta_nfo.RETRY_DELAY = 0  # tests do not need the pause before the retry of a failed read
 
 CHAN = "UCeY0bbntWzzVIaj2z3QigXg"
 JPEG = b"\xff\xd8\xff\xe0" + b"fakejpeg"
@@ -792,6 +793,108 @@ class PlaylistTests(ViewBase):
         self.assertTrue((self.pdir / "Mix.m3u8").exists())
         self.assertFalse((self.pdir / "tvshow.nfo").exists())
         self.assertTrue(any(p.name.startswith("Playlists [") for p in self.view.iterdir()))
+
+
+class UnreadableVideoTests(Base):
+    """A video that cannot be read is reported once, with details; a hiccup on the share is retried first."""
+
+    def test_a_read_that_fails_once_is_retried_and_succeeds(self):
+        video = self.video("aaaaaaaaaaa", mp4_bytes(full_items()))
+        real = ta_nfo.read
+        calls = []
+
+        def flaky(path, images=False, thumb=True):
+            calls.append(path)
+            if len(calls) == 1:
+                raise ValueError("not a readable MP4 (a short read from the share)")
+            return real(path, images, thumb)
+        with mock.patch.object(ta_nfo, "read", flaky):
+            _, meta, err = ta_nfo.safe_read(video)
+        self.assertIsNone(err)
+        self.assertEqual(meta["title"], "TA title")
+        self.assertEqual(len(calls), 2)
+
+    def test_a_read_that_keeps_failing_is_tried_twice_and_reported(self):
+        video = self.video("aaaaaaaaaaa", mp4_bytes(full_items()))
+        with mock.patch.object(ta_nfo, "read", side_effect=OSError(5, "Input/output error")) as read:
+            _, meta, err = ta_nfo.safe_read(video)
+        self.assertIsNone(meta)
+        self.assertIsInstance(err, OSError)
+        self.assertEqual(read.call_count, 2)
+
+    def test_a_bug_is_not_retried(self):
+        video = self.video("aaaaaaaaaaa", mp4_bytes(full_items()))
+        with mock.patch.object(ta_nfo, "read", side_effect=KeyError("x")) as read:
+            _, meta, err = ta_nfo.safe_read(video)
+        self.assertIsInstance(err, KeyError)
+        self.assertEqual(read.call_count, 1)
+
+    def test_the_message_says_what_was_found(self):
+        self.video("aaaaaaaaaaa", mp4_bytes(full_items())[:60], age_days=3)  # cut off: no moov box
+        self.video("bbbbbbbbbbb", b"")
+        _, _, trunc = ta_nfo.safe_read(self.ch / "aaaaaaaaaaa.mp4")
+        _, _, empty = ta_nfo.safe_read(self.ch / "bbbbbbbbbbb.mp4")
+        self.assertIn("60 bytes", str(trunc))
+        self.assertIn("last modified 72h00m ago", str(trunc))
+        self.assertIn("the file is empty (0 bytes)", str(empty))
+
+    def test_one_bad_video_is_one_error_and_the_rest_still_get_their_files(self):
+        self.video("aaaaaaaaaaa", mp4_bytes(full_items()))
+        self.video("bbbbbbbbbbb", mp4_bytes(full_items())[:60])
+        code, out, err = run(self.lib, "--in-place")
+        self.assertEqual(code, 1)
+        self.assertEqual(err.count("error:"), 1)
+        self.assertIn("bbbbbbbbbbb.mp4", err)
+        self.assertTrue((self.ch / "aaaaaaaaaaa.nfo").exists())
+        self.assertFalse((self.ch / "bbbbbbbbbbb.nfo").exists())
+
+
+class UnreadableNewestVideoTests(ViewBase):
+    """The newest video gives the series info; when it is unreadable the channel must still be built."""
+
+    def setup_videos(self):
+        self.video("aaaaaaaaaaa", mp4_bytes(full_items()), age_days=1)
+        self.video("bbbbbbbbbbb", mp4_bytes(full_items())[:60])  # the newest, and cut off
+
+    def test_a_new_channel_is_built_from_the_next_readable_video(self):
+        self.setup_videos()
+        code, _, err = self.vrun()
+        self.assertEqual(code, 1)
+        self.assertEqual(err.count("error:"), 1)  # reported once, not once per step that touched it
+        self.assertIn("bbbbbbbbbbb.mp4", err)
+        self.assertTrue((self.show / "tvshow.nfo").exists())
+        for name in ("poster.jpg", "banner.jpg", "fanart.jpg"):
+            self.assertTrue((self.show / name).exists(), name)
+        names = [p.name for p in self.episode_links()]
+        self.assertEqual(len(names), 1)
+        self.assertIn("[aaaaaaaaaaa]", names[0])
+
+    def test_once_the_file_is_fixed_the_next_run_adds_it_without_a_duplicate_channel(self):
+        self.setup_videos()
+        self.vrun()
+        self.video("bbbbbbbbbbb", mp4_bytes(full_items()))
+        code, _, err = self.vrun()
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual([p.name for p in self.view.iterdir()], ["NBC News"])
+        self.assertEqual(len(self.episode_links()), 2)
+
+    def test_in_place_the_channel_info_comes_from_the_next_readable_video(self):
+        self.setup_videos()
+        code, _, err = run(self.lib, "--in-place")
+        self.assertEqual(code, 1)
+        self.assertEqual(err.count("error:"), 1)
+        self.assertTrue((self.ch / "tvshow.nfo").exists())
+        self.assertTrue((self.ch / "poster.jpg").exists())
+        self.assertTrue((self.ch / "aaaaaaaaaaa.nfo").exists())
+        self.assertFalse((self.ch / "bbbbbbbbbbb.nfo").exists())
+
+    def test_every_video_unreadable_gives_one_error_each_and_no_channel_info(self):
+        self.video("aaaaaaaaaaa", mp4_bytes(full_items())[:60], age_days=1)
+        self.video("bbbbbbbbbbb", mp4_bytes(full_items())[:60])
+        code, _, err = self.vrun()
+        self.assertEqual(code, 1)
+        self.assertEqual(err.count("error:"), 2)
+        self.assertEqual(list(self.view.iterdir()), [])
 
 
 class SpeedAndResumeTests(ViewBase):

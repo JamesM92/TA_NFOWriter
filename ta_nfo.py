@@ -177,10 +177,14 @@ def read_tags(path, skip=()):
             os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_RANDOM)
         except (AttributeError, OSError):
             pass
-        size = os.fstat(f.fileno()).st_size
+        st = os.fstat(f.fileno())
+        size = st.st_size
         moov = _find(f, 0, size, b"moov")
         if not moov:
-            raise ValueError("not a readable MP4 (no moov box; truncated or still being written?)")
+            age = max(time.time() - st.st_mtime, 0)
+            what = ("the file is empty (0 bytes)" if size == 0
+                    else f"{size:,} bytes, last modified {fmt_duration(age)} ago")
+            raise ValueError(f"not a readable MP4 (no moov box; {what}; truncated, or still being written?)")
         udta = _find(f, moov[0], moov[1], b"udta")
         for parent in (udta, moov):
             if not parent:
@@ -354,6 +358,7 @@ class Reporter:
         self.quiet = quiet
         self.logfile = logfile
         self.errors = 0
+        self._seen = set()
 
     def _log(self, msg):
         if self.logfile:
@@ -374,6 +379,9 @@ class Reporter:
         self._log(msg)
 
     def error(self, msg):
+        if msg in self._seen:  # the same problem seen twice in one run (a video read for two reasons) counts once
+            return
+        self._seen.add(msg)
         self.errors += 1
         print(f"error: {msg}", file=sys.stderr)
         self._log(f"error: {msg}")
@@ -547,11 +555,38 @@ def timed(ctx, key, results):
         yield item
 
 
+RETRY_DELAY = 0.5  # seconds before the one retry of a read that failed
+
+
 def safe_read(path: Path, images=False, thumb=True):
-    try:
-        return path, read(path, images, thumb), None
-    except Exception as e:  # unreadable/corrupt file
-        return path, None, e
+    """(path, metadata, None) or (path, None, error). A failed read is tried once more after a short pause: a busy
+    network share can return a short read or an error once, and that must not look like a corrupt video."""
+    for attempt in (1, 2):
+        try:
+            return path, read(path, images, thumb), None
+        except (ValueError, OSError, struct.error) as e:  # unreadable, truncated or a hiccup on the share
+            if attempt == 2:
+                return path, None, e
+            time.sleep(RETRY_DELAY)
+        except Exception as e:  # anything else is a bug or a corrupt file; do not retry
+            return path, None, e
+
+
+def newest_readable(videos, first, images, rep, tries=5):
+    """(path, metadata) of the newest video that can be read, or (None, None).
+
+    `first` is the (path, metadata, error) already read for videos[0]. The series info comes from the newest video,
+    so when that one is unreadable (a half-downloaded upload, say) the next few are tried instead of giving up on
+    the whole channel."""
+    path, meta, _ = first
+    if meta is not None:
+        return path, meta
+    for p, _ in videos[1:tries]:
+        _, m, err = safe_read(p, images)
+        if m is not None:
+            return p, m
+        rep.error(f"cannot read {p}: {err}")
+    return None, None
 
 
 def find_channel_images(videos, rep, first=None):
@@ -670,11 +705,12 @@ def process_channel(folder: Path, ctx: Ctx, pool):
     _, newest, err = safe_read(newest_path, images=True)
     if err:
         rep.error(f"cannot read {newest_path}: {err}")
-    if newest is None:
+    info_path, info = newest_readable(videos, (newest_path, newest, err), True, rep)
+    if info is None:
         return
-    ctx.write_xml(tvshow, tvshow_nfo(newest, folder.name), newest_path)
-    for atom_name, data in find_channel_images(videos, rep, newest).items():
-        ctx.write_image(folder, CHANNEL_IMAGES[atom_name], data, newest_path)
+    ctx.write_xml(tvshow, tvshow_nfo(info, folder.name), info_path)
+    for atom_name, data in find_channel_images(videos, rep, info if info_path == newest_path else None).items():
+        ctx.write_image(folder, CHANNEL_IMAGES[atom_name], data, info_path)
 
 
 # ---------------------------------------------------------------- view mode (separate, linked library)
@@ -915,10 +951,13 @@ def process_channel_view(folder: Path, ctx: Ctx, pool, vindex: ViewIndex):
     ctx.timing["wait"] += time.perf_counter() - t0
     if newest_err:
         rep.error(f"cannot read {newest_path}: {newest_err}")
+    # `newest` stays the newest video's own metadata (it is also its episode); `info` is what the series info is
+    # built from, which is the same unless the newest video cannot be read.
+    info_path, info = newest_readable(videos, (newest_path, newest, newest_err), images_now, rep)
     if existing is None:
-        if newest is None:
+        if info is None:
             return
-        show = vindex.folder_for(folder.name, newest)
+        show = vindex.folder_for(folder.name, info)
     else:
         show = existing
     if not args.dry_run:
@@ -927,8 +966,8 @@ def process_channel_view(folder: Path, ctx: Ctx, pool, vindex: ViewIndex):
     # Write it first: it is how a later run recognises the folder, so a run that stops partway
     # (server reboot) does not leave a folder that gets a duplicate `Channel [ID]` beside it.
     fresh = not tvshow.exists()
-    if fresh and newest is not None:
-        ctx.write_xml(tvshow, tvshow_nfo(newest, folder.name), newest_path)
+    if fresh and info is not None:
+        ctx.write_xml(tvshow, tvshow_nfo(info, folder.name), info_path)
 
     sidecars = scan_sidecars(folder)
     added = False
@@ -971,11 +1010,12 @@ def process_channel_view(folder: Path, ctx: Ctx, pool, vindex: ViewIndex):
 
     if not (args.overwrite or fresh or channel_due(tvshow, show, newest_mtime, added, args.channel_refresh_days)):
         return
-    if newest is None:
+    if info is None:
         return
-    ctx.write_xml(tvshow, tvshow_nfo(newest, folder.name), newest_path)
-    for atom_name, data in find_channel_images(videos, rep, newest if images_now else None).items():
-        ctx.write_image(show, CHANNEL_IMAGES[atom_name], data, newest_path)
+    ctx.write_xml(tvshow, tvshow_nfo(info, folder.name), info_path)
+    first = info if (images_now and info_path == newest_path) else None
+    for atom_name, data in find_channel_images(videos, rep, first).items():
+        ctx.write_image(show, CHANNEL_IMAGES[atom_name], data, info_path)
 
 
 def scan_view_links(root: Path):

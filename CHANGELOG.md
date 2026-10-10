@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed
+- **An unreadable newest video no longer blocks its channel.** The series info (`tvshow.nfo` and the artwork) comes from the channel's newest video. When that video could not be read, for example a half-downloaded upload, a new channel was skipped completely on every run, and an existing channel's series info stopped updating. The next few videos are now tried, so the channel is built from the newest one that can be read.
+- The same unreadable video is reported once per run, not once for each step that touched it (in-place mode reported it twice).
+
+### Changed
+- A video whose read fails is retried once after a short pause before it is reported. A busy network share can return a short read or an error once, which looked like a corrupt file ("no moov box").
+- The unreadable-video message now says what was found: the file size or that it is empty, and how long ago it was last modified.
+
 ## [0.5.0] - 2026-10-08
 
 ### Added
